@@ -172,7 +172,7 @@ impl EtcdDelegate {
             );
         };
         let txn_req = etcd_client::EtcdTxnRequest::new()
-            // etcd：chack key exist in txn
+            // etcd：check key exist in txn
             //  https://github.com/etcd-io/etcd/issues/7115
             //  https://github.com/etcd-io/etcd/issues/6740
             //key does not exist when create revision is 0, check the links above
@@ -311,7 +311,7 @@ impl EtcdDelegate {
         let write_res = self.write_to_etcd(key, value).await?;
         if let Some(pre_value) = write_res {
             panic!(
-                "failed to write new key vaule pair, the key={key} exists in etcd, \
+                "failed to write new key value pair, the key={key} exists in etcd, \
                     the previous value={pre_value:?}"
             );
         } else {
