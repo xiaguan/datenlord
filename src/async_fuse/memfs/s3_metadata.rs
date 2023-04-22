@@ -1,10 +1,10 @@
 use super::cache::GlobalCache;
 use super::dir::DirEntry;
 use super::dist::client as dist_client;
-use super::dist::etcd;
 use super::dist::server::CacheServer;
 use super::fs_util::{self, FileAttr};
 use super::inode::InodeState;
+use super::kv_engine::{EtcdKVEngine, KVEngine};
 use super::metadata::MetaData;
 use super::node::Node;
 use super::s3_node::{self, S3Node};
@@ -25,11 +25,14 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::SFlag;
 use parking_lot::RwLock as SyncRwLock; // conflict with tokio RwLock
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::os::unix::io::RawFd;
 use std::path::Path;
-use std::sync::{atomic::AtomicU32, Arc};
+use std::sync::{atomic::AtomicU32, Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+use tokio::sync::{Mutex, RwLock};
+use crate::async_fuse::memfs::kv_engine::{KeyType, RawS3Node, Txn, ValueType};
+use crate::async_fuse::memfs::serial::{dir_entry_to_serial, file_attr_to_serial};
 
 /// The time-to-live seconds of FUSE attributes
 const MY_TTL_SEC: u64 = 3600; // TODO: should be a long value, say 1 hour
@@ -37,6 +40,9 @@ const MY_TTL_SEC: u64 = 3600; // TODO: should be a long value, say 1 hour
 const MY_GENERATION: u64 = 1; // TODO: find a proper way to set generation
 /// S3 information string delimiter
 const S3_INFO_DELIMITER: char = ';';
+
+// static S3_METADATA : RwLock<Option<Arc<S3Metadata<S>>>> = RwLock::new(None);
+// static S3_BACKEND : RwLock<Option<Arc<dynS3BackEnd + Send + Sync >>> = RwLock::new(None);
 
 /// File system in-memory meta-data
 #[derive(Debug)]
@@ -62,6 +68,10 @@ pub struct S3MetaData<S: S3BackEnd + Send + Sync + 'static> {
     pub(crate) path2inum: RwLock<BTreeMap<String, INum>>,
     /// Fuse fd
     fuse_fd: Mutex<RawFd>,
+    /// KV engine
+    kv_engine: Arc<dyn KVEngine>,
+    /// The metadata itself
+    pub(crate) self_meta: Weak<S3MetaData<S>>,
 }
 
 /// Parse S3 info
@@ -92,7 +102,7 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
             },
         );
 
-        let etcd_arc = Arc::new(etcd_client);
+        let etcd_arc = Arc::new(etcd_client.clone());
         let data_cache = Arc::new(GlobalCache::new_dist_with_bz_and_capacity(
             10_485_760, // 10 * 1024 * 1024
             capacity,
@@ -110,7 +120,11 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
             volume_info: volume_info.to_owned(),
             path2inum: RwLock::new(BTreeMap::new()),
             fuse_fd: Mutex::new(-1_i32),
+            kv_engine: EtcdKVEngine::new(etcd_client.get_raw_client()),
+            self_meta: Weak::new(),
         });
+
+        meta.self_meta = Arc::downgrade(&meta);
 
         let server = CacheServer::new(
             ip.to_owned(),
@@ -132,53 +146,6 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         (meta, Some(server))
     }
 
-    /// Get metadata cache
-    fn cache(&self) -> &RwLock<BTreeMap<INum, Self::N>> {
-        &self.cache
-    }
-
-    /// Set fuse fd into `MetaData`
-    async fn set_fuse_fd(&self, fuse_fd: RawFd) {
-        *self.fuse_fd.lock().await = fuse_fd;
-    }
-
-    /// Try to delete node that is marked as deferred deletion
-    async fn try_delete_node(&self, ino: INum) -> bool {
-        let mut cache = self.cache.write().await;
-        let node = cache.get(&ino).unwrap_or_else(|| {
-            panic!(
-                "try_delete_node() found fs is inconsistent, \
-                    the i-node of ino={ino} is not in cache",
-            );
-        });
-
-        if node.get_open_count() == 0 && node.get_lookup_count() == 0 {
-            debug!(
-                "try_delete_node() deleted i-node of ino={} and name={:?}",
-                ino,
-                node.get_name(),
-            );
-            if let Some(node) = cache.remove(&ino) {
-                if let SFlag::S_IFREG = node.get_type() {
-                    self.data_cache
-                        .remove_file_cache(node.get_full_path().as_bytes())
-                        .await;
-                }
-            }
-            true
-        } else {
-            debug!(
-                "try_delete_node() cannot deleted i-node of ino={} and name={:?},\
-                     open_count={}, lookup_count={}",
-                ino,
-                node.get_name(),
-                node.get_open_count(),
-                node.get_lookup_count()
-            );
-            false
-        }
-    }
-
     /// Helper function to create node
     #[allow(clippy::too_many_lines)]
     async fn create_node_helper(
@@ -190,12 +157,20 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         target_path: Option<&Path>,
     ) -> anyhow::Result<(Duration, FuseAttr, u64)> {
         // pre-check
-        let (parent_full_path, full_path, child_attr, fuse_attr) = {
+        let mut txn = self.kv_engine.new_txn().await;
+        let (parent_node,full_path, child_attr, fuse_attr) = {
+            let mut parent_node = txn.get(&KeyType::INum2Node(parent)).await?.unwrap_or_else(|| {
+                panic!(
+                    "create_node_pre_check() found fs is inconsistent, \
+                    parent of ino={parent} should be in cache before create it new child",
+                )
+            }).get_node(self.s3_backend.clone(),self.self_meta.upgrade().unwrap());
             let mut cache = self.cache.write().await;
-            let parent_node = Self::create_node_pre_check(parent, node_name, &mut cache)
-                .context("create_node_helper() failed to pre check")?;
+            let parent_node = Self::create_node_pre_check(&mut parent_node, node_name, &mut txn).await.
+                context("create_node_helper() failed to pre check")?;
             let full_path = format!("{}{}", parent_node.full_path(), node_name);
             // check cluster conflict creating by trying to alloc ino
+            // TODO(xiaguan) : get the new inum using the txn
             let (inum, is_new) = self.inode_get_inum_by_fullpath(full_path.as_str()).await;
             if !is_new {
                 // inum created by others or exist in remote cache
@@ -279,39 +254,52 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
             let new_ino = new_node.get_ino();
             let new_node_attr = new_node.get_attr();
             let new_node_full_path = new_node.full_path().to_owned();
-            cache.insert(new_ino, new_node);
-            self.path2inum
-                .write()
-                .await
-                .insert(new_node_full_path, new_ino);
+            // cache.insert(new_ino, new_node);
+            let new_node_key = KeyType::INum2Node(new_ino);
+            let new_node_value = ValueType::Node(RawS3Node::new(new_node));
+            txn.set(&new_node_key, &new_node_value).await?;
+            // self.path2inum
+            //     .write()
+            //     .await
+            //     .insert(new_node_full_path, new_ino);
+            txn.set(&KeyType::Path2INum(new_node_full_path), &ValueType::INum(new_ino)).await?;
             let fuse_attr = fs_util::convert_to_fuse_attr(new_node_attr);
             debug!(
                 "create_node_helper() successfully created the new child name={:?} \
                 of ino={} and type={:?} under parent ino={} and name={:?}",
                 node_name, new_ino, node_type, parent, parent_name,
             );
-            let pnode = cache.get(&parent).unwrap_or_else(|| {
-                panic!("failed to get parent inode {parent:?}, parent name {parent_name:?}")
-            });
+            // let pnode = cache.get(&parent).unwrap_or_else(|| {
+            //     panic!("failed to get parent inode {parent:?}, parent name {parent_name:?}")
+            // });
+            // TODO(xiaguan) : add comment why we don't need to get the parent node again
             (
-                pnode.full_path().to_owned(),
+                parent_node,
                 full_path,
                 new_node_attr,
                 fuse_attr,
             )
         };
 
-        self.sync_attr_remote(&parent_full_path).await;
-        self.sync_dir_remote(&parent_full_path, node_name, &child_attr, target_path)
-            .await;
+        // sync to remote
+        // self.sync_attr_remote(&parent_full_path).await;
+        txn.set(&KeyType::INum2Attr(parent), &ValueType::Attr(file_attr_to_serial(parent_node.get_attr()))).await?;
+        // self.sync_dir_remote(&parent_full_path, node_name, &child_attr, target_path)
+        //     .await;
+        txn.set(
+            &KeyType::INum2DirEntry(parent),
+            &ValueType::DirEntry(dir_entry_to_serial(parent_node.get_entry().unwrap()))
+        ).await?;
         // inode is cached, so we should remove the path mark
         // We dont need to sync for the unmark
-        let etcd_client = Arc::clone(&self.etcd_client);
-        let volume = self.volume_info.clone();
-        tokio::spawn(async move {
-            let vol = volume;
-            etcd::unmark_fullpath_with_ino_in_etcd(etcd_client, &vol, full_path).await;
-        });
+        // let etcd_client = Arc::clone(&self.etcd_client);
+        // let volume = self.volume_info.clone();
+        // tokio::spawn(async move {
+        //     let vol = volume;
+        //     etcd::unmark_fullpath_with_ino_in_etcd(etcd_client, &vol, full_path).await;
+        // });
+
+        txn.commit().await?;
 
         let ttl = Duration::new(MY_TTL_SEC, 0);
         Ok((ttl, fuse_attr, MY_GENERATION))
@@ -482,6 +470,48 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         Ok(())
     }
 
+    /// Get metadata cache
+    fn cache(&self) -> &RwLock<BTreeMap<INum, Self::N>> {
+        &self.cache
+    }
+
+    /// Try to delete node that is marked as deferred deletion
+    async fn try_delete_node(&self, ino: INum) -> bool {
+        let mut cache = self.cache.write().await;
+        let node = cache.get(&ino).unwrap_or_else(|| {
+            panic!(
+                "try_delete_node() found fs is inconsistent, \
+                    the i-node of ino={ino} is not in cache",
+            );
+        });
+
+        if node.get_open_count() == 0 && node.get_lookup_count() == 0 {
+            debug!(
+                "try_delete_node() deleted i-node of ino={} and name={:?}",
+                ino,
+                node.get_name(),
+            );
+            if let Some(node) = cache.remove(&ino) {
+                if let SFlag::S_IFREG = node.get_type() {
+                    self.data_cache
+                        .remove_file_cache(node.get_full_path().as_bytes())
+                        .await;
+                }
+            }
+            true
+        } else {
+            debug!(
+                "try_delete_node() cannot deleted i-node of ino={} and name={:?},\
+                     open_count={}, lookup_count={}",
+                ino,
+                node.get_name(),
+                node.get_open_count(),
+                node.get_lookup_count()
+            );
+            false
+        }
+    }
+
     /// Helper function to write data
     async fn write_helper(
         &self,
@@ -519,22 +549,22 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         self.sync_attr_remote(&full_path).await;
         result
     }
+
+    /// Set fuse fd into `MetaData`
+    async fn set_fuse_fd(&self, fuse_fd: RawFd) {
+        *self.fuse_fd.lock().await = fuse_fd;
+    }
 }
 
 impl<S: S3BackEnd + Send + Sync + 'static> S3MetaData<S> {
     /// The pre-check before create node
     #[allow(single_use_lifetimes)]
-    fn create_node_pre_check<'b>(
-        parent: INum,
+    async fn create_node_pre_check<'b>(
+        parent_node: &mut S3Node<S>,
         node_name: &str,
-        cache: &'b mut RwLockWriteGuard<BTreeMap<INum, <Self as MetaData>::N>>,
+        mut txn: &mut Box<dyn Txn + Send>
     ) -> anyhow::Result<&'b mut <Self as MetaData>::N> {
-        let parent_node = cache.get_mut(&parent).unwrap_or_else(|| {
-            panic!(
-                "create_node_pre_check() found fs is inconsistent, \
-                    parent of ino={parent} should be in cache before create it new child",
-            );
-        });
+        let parent = parent_node.get_ino();
         if let Some(occupied) = parent_node.get_entry(node_name) {
             debug!(
                 "create_node_pre_check() found the directory of ino={} and name={:?} \

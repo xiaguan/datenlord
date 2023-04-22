@@ -409,4 +409,11 @@ impl EtcdDelegate {
             .add_context("failed to delete all data from etcd")?;
         Ok(())
     }
+
+    /// Get the raw etcd client for `kv_engine` module
+    #[inline]
+    #[must_use]
+    pub fn get_raw_client(&self) -> etcd_client::Client {
+        self.etcd_rs_client.clone()
+    }
 }

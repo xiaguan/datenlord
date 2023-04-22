@@ -100,7 +100,7 @@ pub fn serial_to_dir_entry(entry: &SerialDirEntry) -> DirEntry {
 
 /// Convert `FileAttr` to `SerialFileAttr`
 #[must_use]
-pub fn file_attr_to_serial(attr: &FileAttr) -> SerialFileAttr {
+pub fn file_attr_to_serial(attr: FileAttr) -> SerialFileAttr {
     SerialFileAttr {
         ino: attr.ino,
         size: attr.size,
@@ -129,7 +129,7 @@ pub fn file_attr_to_serial(attr: &FileAttr) -> SerialFileAttr {
 
 /// Convert `SerialFileAttr` to `FileAttr`
 #[must_use]
-pub const fn serial_to_file_attr(attr: &SerialFileAttr) -> FileAttr {
+pub const fn serial_to_file_attr(attr: SerialFileAttr) -> FileAttr {
     FileAttr {
         ino: attr.ino,
         size: attr.size,

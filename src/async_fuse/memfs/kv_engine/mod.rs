@@ -1,66 +1,31 @@
-
 use super::INum;
 use async_trait::async_trait;
 use core::fmt::Debug;
 use datenlord::common::error::{Context, DatenLordError, DatenLordResult};
 use etcd_client::TxnCmp;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::sync::Arc;
+use parking_lot::RwLock;
+use crate::async_fuse::memfs::cache::GlobalCache;
+use crate::async_fuse::memfs::s3_node::{S3Node, S3NodeData};
+use crate::async_fuse::memfs::s3_wrapper::S3BackEnd;
+use crate::async_fuse::memfs::S3MetaData;
 
-/// In order to derive Serialize and Deserialize,
-/// Replace the `SFlag` with `u32` , `u32` can later be converted to `SFlag`
-#[derive(Serialize, Deserialize, Debug)]
-pub struct RawFileAttr{
-        /// Inode number
-        pub ino: INum,
-        /// Size in bytes
-        pub size: u64,
-        /// Size in blocks
-        pub blocks: u64,
-        /// Time of last access
-        pub atime: SystemTime,
-        /// Time of last modification
-        pub mtime: SystemTime,
-        /// Time of last change
-        pub ctime: SystemTime,
-        /// Time of creation (macOS only)
-        pub crtime: SystemTime,
-        /// Kind of file (directory, file, pipe, etc)
-        pub kind: u32,
-        /// Permissions
-        pub perm: u16,
-        /// Number of hard links
-        pub nlink: u32,
-        /// User id
-        pub uid: u32,
-        /// Group id
-        pub gid: u32,
-        /// Rdev
-        pub rdev: u32,
-        /// Flags (macOS only, see chflags(2))
-        pub flags: u32,
-}
-
-/// In order to derive Serialize and Deserialize,
-/// Replace the `Arc<FileAttr>` with `RawFileAttr` in `DirEntry`
-#[derive(Serialize, Deserialize, Debug)]
-pub struct RawDirEntry{
-    pub name: String,
-    pub file_attr : RawFileAttr,
-}
+use super::serial::*;
 
 /// In order to derive Serialize and Deserialize,
 /// Replace the 'BTreeMap<String, DirEntry>' with 'HashMap<String, RawDirEntry>'
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RawS3NodeData {
-    Directory(HashMap<String,RawDirEntry>),
+    Directory(BTreeMap<String, SerialDirEntry>),
     /// File data is ignored ,because `Arc<GlobalCache>` is not serializable
+    File,
     SymLink(PathBuf),
 }
-
 
 /// In order to derive Serialize and Deserialize,
 /// Ignore the `s3_backend` and `meta` in `S3Node` , because they are not serializable
@@ -74,7 +39,7 @@ pub struct RawS3Node {
     /// Full path
     full_path: String,
     /// S3Node attribute
-    attr: RawFileAttr,
+    attr: SerialFileAttr,
     /// S3Node data
     data: RawS3NodeData,
     /// S3Node open counter
@@ -85,13 +50,62 @@ pub struct RawS3Node {
     deferred_deletion: bool,
 }
 
+impl RawS3Node {
+    pub fn new<S: S3BackEnd + Send + Sync + 'static>(node: S3Node<S>) -> Self {
+        let data = match &node.data {
+            S3NodeData::Directory(dir) => {
+                let mut dir_map = BTreeMap::new();
+                for (name, entry) in dir.iter() {
+                    dir_map.insert(name.clone(), dir_entry_to_serial(entry));
+                }
+                RawS3NodeData::Directory(dir_map)
+            }
+            S3NodeData::RegFile(_) => RawS3NodeData::File,
+            S3NodeData::SymLink(path) => RawS3NodeData::SymLink(path.clone()),
+        };
+        Self {
+            parent: node.parent,
+            name: node.name.clone(),
+            full_path: node.full_path.clone(),
+            attr: file_attr_to_serial(node.attr.read().clone()),
+            data,
+            open_count: node.open_count.load(std::sync::atomic::Ordering::Relaxed),
+            lookup_count: node.lookup_count.load(std::sync::atomic::Ordering::Relaxed),
+            deferred_deletion: node.deferred_deletion.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+
+
 /// The ValueType is used to provide support for metadata.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ValueType {
     Node(RawS3Node),
-    DirEntry(RawDirEntry),
+    DirEntry(SerialDirEntry),
     INum(INum),
-    Attr(RawFileAttr),
+    Attr(SerialFileAttr),
+}
+
+impl ValueType {
+    pub fn get_node<S: S3BackEnd + Send + Sync + 'static>(self, back_end : Arc<S>,meta : Arc<S3MetaData<S>>) -> S3Node<S> {
+        match self {
+            ValueType::Node(node) => {
+                S3Node::new(
+                    node.parent,
+                    &*node.name.clone(),
+                    node.full_path.clone(),
+                    Arc::new(RwLock::new(serial_to_file_attr(node.attr))),
+                    S3NodeData::RegFile(Arc::new(GlobalCache::new())),
+                    back_end,
+                    meta,
+                )
+            }
+            _ => {
+                panic!("ValueType is not a S3Node");
+            },
+        }
+    }
 }
 
 /// The KeyType is used to locate the value in the distributed K/V storage.
@@ -121,7 +135,7 @@ impl KeyType {
 /// The Txn is used to provide support for metadata.
 #[async_trait]
 pub trait Txn {
-    /// Get the value by the key. 
+    /// Get the value by the key.
     /// Notice : do not get the same key twice in one transaction.
     async fn get(&mut self, key: &KeyType) -> DatenLordResult<Option<ValueType>>;
     /// Set the value by the key.
@@ -135,7 +149,7 @@ pub trait Txn {
 
 /// To support different K/V storage engines, we need to a trait to abstract the K/V storage engine.
 #[async_trait]
-pub trait KVEngine {
+pub trait KVEngine: Send + Sync + Debug {
     /// Create a new transaction.
     async fn new_txn(&self) -> Box<dyn Txn + Send>;
 }
@@ -169,12 +183,12 @@ impl Txn for EtcdTxn {
         // first check if the key is in buffer (write op)
         let key = key.get_key();
         if let Some(_) = self.buffer.get(&key) {
-                panic!("get the key after write in the same transaction")
+            panic!("get the key after write in the same transaction")
         }
         if let Some(_) = self.version_map.get(&key) {
             panic!("get the key twice in the same transaction");
         }
-         // Fetch the value from `etcd`
+        // Fetch the value from `etcd`
         let req = etcd_client::EtcdGetRequest::new(key.clone());
         let mut resp = self
             .client
@@ -258,13 +272,20 @@ impl Txn for EtcdTxn {
 }
 
 #[derive(Clone)]
-struct EtcdKVEngine {
+pub struct EtcdKVEngine {
     client: etcd_client::Client,
+}
+
+impl Debug for EtcdKVEngine {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EtcdKVEngine").finish()
+    }
 }
 
 impl EtcdKVEngine {
     #[allow(dead_code)]
-    async fn new(etcd_address_vec : Vec<String> ) -> DatenLordResult<Self> {
+    async fn new_for_local_test(etcd_address_vec: Vec<String>) -> DatenLordResult<Self> {
         let client = etcd_client::Client::connect(etcd_client::ClientConfig::new(
             etcd_address_vec.clone(),
             None,
@@ -272,8 +293,17 @@ impl EtcdKVEngine {
             true,
         ))
         .await
-        .with_context(|| format!("failed to build etcd client to addresses={etcd_address_vec:?}"))?;
+        .with_context(|| {
+            format!("failed to build etcd client to addresses={etcd_address_vec:?}")
+        })?;
         Ok(EtcdKVEngine { client })
+    }
+
+    /// Create a new etcd kv engine.
+    pub fn new(etcd_client: etcd_client::Client) -> Arc<dyn KVEngine> {
+        Arc::new(EtcdKVEngine {
+            client: etcd_client,
+        })
     }
 }
 
@@ -293,7 +323,9 @@ mod test {
 
     #[tokio::test]
     async fn test_connect_local() {
-        let client = EtcdKVEngine::new(vec![ETCD_ADDRESS.to_string()]).await.unwrap();
+        let client = EtcdKVEngine::new_for_local_test(vec![ETCD_ADDRESS.to_string()])
+            .await
+            .unwrap();
         let mut txn = client.new_txn().await;
         let key = KeyType::Path2INum(String::from("/"));
         let value = ValueType::INum(12);
@@ -312,11 +344,13 @@ mod test {
     async fn test_easy_commit_fail() {
         // Generate three transactions
         // The first one will set two keys and commit
-        // And the second one read two keys 
+        // And the second one read two keys
         // And the third one will set two keys and commit
         // What we expect is that the second one will fail
-        // Between it's read ,the thrird one will set the same key
-        let client = EtcdKVEngine::new(vec![ETCD_ADDRESS.to_string()]).await.unwrap();
+        // Between it's read ,the third one will set the same key
+        let client = EtcdKVEngine::new_for_local_test(vec![ETCD_ADDRESS.to_string()])
+            .await
+            .unwrap();
         let mut first_txn = client.new_txn().await;
         let key1 = KeyType::Path2INum(String::from("/"));
         let value1 = ValueType::INum(12);
@@ -330,7 +364,9 @@ mod test {
         let (first_step_tx, first_step_rx) = tokio::sync::oneshot::channel::<()>();
         let (second_step_tx, second_step_rx) = tokio::sync::oneshot::channel::<()>();
         let second_handle = tokio::spawn(async move {
-            let client = EtcdKVEngine::new(vec![ETCD_ADDRESS.to_string()]).await.unwrap();
+            let client = EtcdKVEngine::new_for_local_test(vec![ETCD_ADDRESS.to_string()])
+                .await
+                .unwrap();
             let mut second_txn = client.new_txn().await;
             let key1 = KeyType::Path2INum(String::from("/"));
             let value1 = second_txn.get(&key1).await.unwrap();
@@ -357,7 +393,9 @@ mod test {
             assert!(res.is_err());
         });
         let third_handle = tokio::spawn(async move {
-            let client = EtcdKVEngine::new(vec![ETCD_ADDRESS.to_string()]).await.unwrap();
+            let client = EtcdKVEngine::new_for_local_test(vec![ETCD_ADDRESS.to_string()])
+                .await
+                .unwrap();
             let mut third_txn = client.new_txn().await;
             // wait for the second read first key and send the signal
             first_step_rx.await.unwrap();
@@ -365,8 +403,8 @@ mod test {
             let value1 = ValueType::INum(14);
             third_txn.set(&key1, &value1).await.unwrap();
             third_txn.commit().await.unwrap();
-                        // send the signal to the second txn
-                        second_step_tx.send(()).unwrap();
+            // send the signal to the second txn
+            second_step_tx.send(()).unwrap();
         });
         second_handle.await.unwrap();
         third_handle.await.unwrap();

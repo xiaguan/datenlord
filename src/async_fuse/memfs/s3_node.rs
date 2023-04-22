@@ -44,30 +44,30 @@ pub enum S3NodeData {
 #[derive(Debug)]
 pub struct S3Node<S: S3BackEnd + Sync + Send + 'static> {
     /// S3 Backend
-    s3_backend: Arc<S>,
+    pub(crate) s3_backend: Arc<S>,
     /// Parent node i-number
-    parent: u64,
+    pub(crate) parent: u64,
     /// S3Node name
-    name: String,
+    pub(crate) name: String,
     /// Full path
-    full_path: String,
+    pub(crate) full_path: String,
     /// S3Node attribute
-    attr: Arc<RwLock<FileAttr>>,
+    pub(crate) attr: Arc<RwLock<FileAttr>>,
     /// S3Node data
-    data: S3NodeData,
+    pub(crate) data: S3NodeData,
     /// S3Node open counter
-    open_count: AtomicI64,
+    pub(crate) open_count: AtomicI64,
     /// S3Node lookup counter
-    lookup_count: AtomicI64,
+    pub(crate) lookup_count: AtomicI64,
     /// If S3Node has been marked as deferred deletion
-    deferred_deletion: AtomicBool,
+    pub(crate) deferred_deletion: AtomicBool,
     /// Shared metadata
     meta: Arc<S3MetaData<S>>,
 }
 
 impl<S: S3BackEnd + Send + Sync + 'static> S3Node<S> {
     /// Create `S3Node`
-    fn new(
+    pub(crate) fn new(
         parent: u64,
         name: &str,
         full_path: String,
