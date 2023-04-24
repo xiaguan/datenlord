@@ -31,4 +31,4 @@ jobs:
       - name: Upload coverage report
         uses: codecov/codecov-action@v3
         with:
-          files: ./coverage/xline_cov.lcovrc,./coverage/curp_cov.lcovrc,./coverage/utils_cov.lcovrc
+          files: ./coverage/datenlord_cov.lcovrc
