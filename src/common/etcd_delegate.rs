@@ -409,4 +409,9 @@ impl EtcdDelegate {
             .add_context("failed to delete all data from etcd")?;
         Ok(())
     }
+
+    /// Get inner etcd client clone
+    pub fn get_client_clone(&self) -> etcd_client::Client {
+        self.etcd_rs_client.clone()
+    }
 }

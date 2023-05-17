@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::RwLockWriteGuard;
 
 /// S3's available fd count
 static GLOBAL_S3_FD_CNT: AtomicU32 = AtomicU32::new(4);
@@ -146,6 +145,17 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3Node<S> {
             k8s_node_id: Arc::clone(&meta.node_id),
             k8s_volume_info: Arc::clone(&meta.volume_info),
         }
+    }
+
+    /// Update child node's attribute
+    pub fn update_child_attr(&mut self, child_name: &str, attr: &FileAttr) {
+        let dir = match self.data {
+            S3NodeData::Directory(ref mut dir) => dir,
+            _ => panic!("update_child_attr: not a directory"),
+        };
+        let new_child_dir_entry =
+            DirEntry::new(child_name.to_owned(), Arc::new(RwLock::new(attr.clone())));
+        dir.insert(child_name.to_owned(), new_child_dir_entry);
     }
 
     /// This function is used to create a new `S3Node` by module `serial`
@@ -448,20 +458,20 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3Node<S> {
 pub async fn rename_fullpath_recursive<S: S3BackEnd + Send + Sync + 'static>(
     ino: INum,
     parent: INum,
-    cache: &mut RwLockWriteGuard<'_, BTreeMap<INum, S3Node<S>>>,
+    meta: &S3MetaData<S>,
 ) {
     let mut node_pool: VecDeque<(INum, INum)> = VecDeque::new();
     node_pool.push_back((ino, parent));
 
     while let Some((child, parent)) = node_pool.pop_front() {
-        let parent_node = cache.get(&parent).unwrap_or_else(|| {
+        let parent_node = meta.get_node_from_kv_engine(parent).await.unwrap_or_else(|| {
             panic!(
                 "impossible case when rename, the parent i-node of ino={parent} should be in the cache"
             )
         });
         let parent_path = parent_node.full_path.clone();
 
-        let child_node = cache.get_mut(&child).unwrap_or_else(|| {
+        let mut child_node = meta.get_node_from_kv_engine(child).await.unwrap_or_else(|| {
             panic!(
                 "impossible case when rename, the child i-node of ino={child} should be in the cache"
             )
