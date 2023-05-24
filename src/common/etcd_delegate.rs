@@ -410,8 +410,10 @@ impl EtcdDelegate {
         Ok(())
     }
 
-    /// Get inner etcd client clone
-    pub fn get_client_clone(&self) -> etcd_client::Client {
+    /// Get the inner etcd client's clone
+    #[must_use]
+    #[inline]
+    pub fn get_inner_client_clone(&self) -> etcd_client::Client {
         self.etcd_rs_client.clone()
     }
 }

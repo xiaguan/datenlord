@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-use std::sync::Arc;
-
 use super::serial::{SerialDirEntry, SerialFileAttr, SerialNode};
 
 /// The `ValueType` is used to provide support for metadata.
@@ -20,7 +18,7 @@ pub enum ValueType {
     DirEntry(SerialDirEntry),
     /// INum
     INum(INum),
-    /// FileAttr
+    /// FileAttr FileAttr
     Attr(SerialFileAttr),
 }
 
@@ -28,18 +26,20 @@ impl ValueType {
     #[allow(dead_code)]
     /// Turn the `ValueType` into `SerialNode` then into `S3Node`.
     // Notice : If the value is not `ValueType::Node`, it will panic
-    pub fn into_s3_node<S: S3BackEnd + Send + Sync + 'static>(
+    pub async fn into_s3_node<S: S3BackEnd + Send + Sync + 'static, K: KVEngine + 'static>(
         self,
-        meta: &S3MetaData<S>,
+        meta: &S3MetaData<S, K>,
     ) -> S3Node<S> {
         match self {
-            ValueType::Node(node) => S3Node::from_serial_node(node, meta),
+            ValueType::Node(node) => S3Node::from_serial_node(node, meta).await,
             ValueType::DirEntry(_) | ValueType::INum(_) | ValueType::Attr(_) => {
                 panic!("expect ValueType::Node but get {self:?}");
             }
         }
     }
 
+    #[allow(dead_code)]
+    #[must_use]
     /// Turn the `ValueType` into `INum`.
     // Notice : If the value is not `ValueType::INum`, it will panic
     pub fn into_inum(self) -> INum {
@@ -52,6 +52,7 @@ impl ValueType {
     }
 }
 
+#[derive(Debug)]
 /// The `KeyType` is used to locate the value in the distributed K/V storage.
 /// Every key is prefixed with a string to indicate the type of the value.
 /// If you want to add a new type of value, you need to add a new variant to the enum.
@@ -69,6 +70,7 @@ pub enum KeyType {
 }
 
 impl KeyType {
+    #[must_use]
     /// Get the key in bytes.
     pub fn get_key(&self) -> Vec<u8> {
         match *self {
@@ -101,6 +103,8 @@ pub trait MetaTxn {
 /// Notice : We do not support one key corresponding to multiple values
 #[async_trait]
 pub trait KVEngine: Send + Sync + Debug {
+    /// create a new KVEngine.
+    fn new(etcd_client: etcd_client::Client) -> Self;
     /// Create a new transaction.
     async fn new_meta_txn(&self) -> Box<dyn MetaTxn + Send>;
 
@@ -248,14 +252,6 @@ impl EtcdKVEngine {
         })?;
         Ok(EtcdKVEngine { client })
     }
-
-    #[allow(dead_code)]
-    /// Create a new etcd kv engine.
-    pub fn new_kv_engine(etcd_client: etcd_client::Client) -> Arc<dyn KVEngine> {
-        Arc::new(EtcdKVEngine {
-            client: etcd_client,
-        })
-    }
 }
 
 #[allow(unused_macros)]
@@ -293,6 +289,12 @@ macro_rules! retry_txn {
 
 #[async_trait]
 impl KVEngine for EtcdKVEngine {
+    #[must_use]
+    fn new(etcd_client: etcd_client::Client) -> Self {
+        EtcdKVEngine {
+            client: etcd_client,
+        }
+    }
     async fn new_meta_txn(&self) -> Box<dyn MetaTxn + Send> {
         Box::new(EtcdTxn::new(self.client.clone()))
     }
@@ -304,7 +306,7 @@ impl KVEngine for EtcdKVEngine {
             .kv()
             .get(req)
             .await
-            .with_context(|| format!("failed to get GetResponse from etcd, key={:?}", key))?;
+            .with_context(|| format!("failed to get GetResponse from etcd, key={key:?}"))?;
 
         let kvs = resp.take_kvs();
         // we don't expect to have multiple values for one key
