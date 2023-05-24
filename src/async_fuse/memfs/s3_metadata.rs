@@ -46,6 +46,8 @@ const MY_TTL_SEC: u64 = 3600; // TODO: should be a long value, say 1 hour
 const MY_GENERATION: u64 = 1; // TODO: find a proper way to set generation
 /// S3 information string delimiter
 const S3_INFO_DELIMITER: char = ';';
+// Default transaction retry times
+const DEFAULT_TXN_RETRY_TIMES: u32 = 10;
 
 /// File system in-memory meta-data
 #[derive(Debug)]
@@ -149,9 +151,11 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
             });
 
         let full_path = root_inode.full_path().to_owned();
-        meta.cache.write().await.insert(FUSE_ROOT_ID, root_inode);
-        meta.path2inum.write().await.insert(full_path, FUSE_ROOT_ID);
-
+        // insert two K/V pairs into KV engine
+        // 1. FUSE_ROOT_ID -> root_inode
+        meta.set_node_to_kv_engine(FUSE_ROOT_ID, root_inode);
+        // 2. full_path -> FUSE_ROOT_ID
+        meta.set_inum_to_kv_engine(&full_path, FUSE_ROOT_ID);
         (meta, Some(server), async_tasks)
     }
 
@@ -167,27 +171,26 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
 
     /// Try to delete node that is marked as deferred deletion
     async fn try_delete_node(&self, ino: INum) -> bool {
-        let mut cache = self.cache.write().await;
-        let node = cache.get(&ino).unwrap_or_else(|| {
+        let node = self.get_node_from_kv_engine(ino).await.unwrap_or_else(|| {
             panic!(
                 "try_delete_node() found fs is inconsistent, \
-                    the i-node of ino={ino} is not in cache",
+                    the i-node of ino={ino} is not in K/V",
             );
         });
-
+        let node = node.as_ref();
         if node.get_open_count() == 0 && node.get_lookup_count() == 0 {
             debug!(
                 "try_delete_node() deleted i-node of ino={} and name={:?}",
                 ino,
                 node.get_name(),
             );
-            if let Some(node) = cache.remove(&ino) {
-                if let SFlag::S_IFREG = node.get_type() {
-                    self.data_cache
-                        .remove_file_cache(node.get_full_path().as_bytes())
-                        .await;
-                }
+            self.remove_node_from_kv_engine(ino).await;
+            if let SFlag::S_IFREG = node.get_type() {
+                self.data_cache
+                    .remove_file_cache(node.get_full_path().as_bytes())
+                    .await;
             }
+
             true
         } else {
             debug!(
@@ -380,7 +383,7 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
         child_name: &str,
     ) -> DatenLordResult<(Duration, FuseAttr, u64)> {
         let pre_check_res = self.lookup_pre_check(parent, child_name).await;
-        let (ino, child_type, child_attr) = match pre_check_res {
+        let (child_ino, child_type, child_attr) = match pre_check_res {
             Ok((ino, child_type, child_attr)) => (ino, child_type, child_attr),
             Err(e) => {
                 debug!("lookup() failed to pre-check, the error is: {}", e);
@@ -392,18 +395,19 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
         {
             // cache hit
             let cache = self.cache.read().await;
-            if let Some(node) = cache.get(&ino) {
+            let child_node = self.get_node_from_kv_engine(child_ino).await;
+            if let Some(node) = child_node {
                 debug!(
                     "lookup_helper() cache hit when searching i-node of \
-                        ino={} and name={:?} under parent ino={}",
-                    ino, child_name, parent,
+                    child_ino={} and name={:?} under parent ino={}",
+                    child_ino, child_name, parent,
                 );
-                let attr = node.lookup_attr();
+                let attr = node.as_ref().lookup_attr();
                 let fuse_attr = fs_util::convert_to_fuse_attr(attr);
                 debug!(
                     "lookup_helper() successfully found in cache the i-node of \
-                        ino={} name={:?} under parent ino={}, the attr={:?}",
-                    ino, child_name, parent, &attr,
+                    child_ino={} name={:?} under parent ino={}, the attr={:?}",
+                    child_ino, child_name, parent, &attr,
                 );
                 return Ok((ttl, fuse_attr, MY_GENERATION));
             }
@@ -413,7 +417,7 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
             debug!(
                 "lookup_helper() cache missed when searching parent ino={} \
                     and i-node of ino={} and name={:?}",
-                parent, ino, child_name,
+                parent, child_ino, child_name,
             );
             let (mut child_node, parent_name) = {
                 let cache = self.cache.read().await;
@@ -459,9 +463,9 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
                 (child_node, parent_name)
             };
 
-            debug_assert_eq!(ino, child_node.get_ino());
-            child_node.set_ino(ino);
-            let child_ino = ino;
+            debug_assert_eq!(child_ino, child_node.get_ino());
+            child_node.set_ino(child_ino);
+            let child_ino = child_ino;
             let attr = child_node.lookup_attr();
             let full_path = child_node.full_path().to_owned();
             {
@@ -535,48 +539,34 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> MetaData for S
     ) -> DatenLordResult<usize> {
         let data_len = data.len();
         let (result, full_path, parent_ino) = {
-            let mut cache = self.cache().write().await;
-            let inode = cache.get_mut(&ino).unwrap_or_else(|| {
+            let inode = self.get_node_from_kv_engine(ino).await.unwrap_or_else(|| {
                 panic!(
                     "write() found fs is inconsistent, \
                      the inode ino={ino} is not in cache"
                 );
             });
-            let parent_ino = inode.get_parent_ino();
+            let parent_ino = inode.as_ref().get_parent_ino();
 
             debug!(
                 "write_helper() about to write {} byte data to file of ino={} \
                 and name {:?} at offset={}",
                 data.len(),
                 ino,
-                inode.get_name(),
+                inode.as_ref().get_name(),
                 offset
             );
             let o_flags = fs_util::parse_oflag(flags);
             let write_to_disk = true;
             let res = inode
+                .as_mut_ref()
                 .write_file(fh, offset, data, o_flags, write_to_disk)
                 .await;
-            (res, inode.get_full_path().to_owned(), parent_ino)
+            (res, inode.as_ref().get_full_path().to_owned(), parent_ino)
         };
         self.invalidate_remote(&full_path, offset, data_len).await;
-        self.sync_attr_remote(&full_path).await;
-        // update dir
-        let cache = self.cache().write().await;
-        let parent = cache.get(&parent_ino).unwrap_or_else(|| {
-            panic!(
-                "write() found fs is inconsistent, \
-                        the inode ino={ino} is not in cache"
-            );
-        });
-        self.persist_handle.mark_dirty(
-            parent.get_ino(),
-            PersistDirContent::new_from_cache(
-                parent.full_path().to_owned(),
-                parent.get_dir_data(),
-                serial::file_attr_to_serial(&parent.get_attr()),
-            ),
-        );
+        // We don't need to sync the dirty node because it will be synced when it is dropped
+        // We don't need to update parent dir here
+        // Because when the parent dir is loaded from KV, it will be updated
         result
     }
     /// Stop all async tasks
@@ -859,14 +849,16 @@ impl<S: S3BackEnd + Send + Sync + 'static, K: KVEngine + 'static> S3MetaData<S, 
         name: &str,
     ) -> DatenLordResult<(INum, SFlag, Arc<SyncRwLock<FileAttr>>)> {
         // lookup child ino and type first
-        let cache = self.cache.read().await;
-        let parent_node = cache.get(&parent).unwrap_or_else(|| {
-            panic!(
-                "lookup_helper() found fs is inconsistent, \
+        let parent_node = self
+            .get_node_from_kv_engine(parent)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "lookup_helper() found fs is inconsistent, \
                         the parent i-node of ino={parent} should be in cache",
-            );
-        });
-        if let Some(child_entry) = parent_node.get_entry(name) {
+                );
+            });
+        if let Some(child_entry) = parent_node.as_ref().get_entry(name) {
             let ino = child_entry.ino();
             let child_type = child_entry.entry_type();
             Ok((ino, child_type, Arc::clone(child_entry.file_attr_arc_ref())))
@@ -876,7 +868,7 @@ impl<S: S3BackEnd + Send + Sync + 'static, K: KVEngine + 'static> S3MetaData<S, 
                     under parent directory of ino={} and name={:?}",
                 name,
                 parent,
-                parent_node.get_name(),
+                parent_node.as_ref().get_name(),
             );
             // lookup() didn't find anything, this is normal
             util::build_error_result_from_errno(
@@ -886,7 +878,7 @@ impl<S: S3BackEnd + Send + Sync + 'static, K: KVEngine + 'static> S3MetaData<S, 
                         under parent directory of ino={} and name={:?}",
                     name,
                     parent,
-                    parent_node.get_name(),
+                    parent_node.as_ref().get_name(),
                 ),
             )
         }

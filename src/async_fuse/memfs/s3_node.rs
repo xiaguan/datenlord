@@ -123,13 +123,13 @@ impl<S: S3BackEnd + Sync + Send + 'static, K: KVEngine + 'static> S3NodeWrap<'_,
 
     #[allow(dead_code)]
     /// Get immutable reference to the node
-    pub fn get_node(&self) -> &S3Node<S> {
+    pub fn as_ref(&self) -> &S3Node<S> {
         &self.node
     }
 
     #[allow(dead_code)]
     /// Get mutable reference to the node
-    pub fn get_node_mut(&mut self) -> &mut S3Node<S> {
+    pub fn as_mut_ref(&mut self) -> &mut S3Node<S> {
         self.dirty = true;
         &mut self.node
     }
