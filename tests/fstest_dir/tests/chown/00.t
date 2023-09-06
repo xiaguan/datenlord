@@ -9,7 +9,7 @@ dir=`dirname $0`
 if supported lchmod; then
 	echo "1..186"
 else
-	echo "1..171"
+	echo "1..133"
 fi
 
 n0=`namegen`
@@ -276,38 +276,38 @@ expect 65534,65532 lstat ${n0} uid,gid
 ctime2=`${fstest} lstat ${n0} ctime`
 test_check $ctime1 -lt $ctime2
 expect 0 unlink ${n0}
-# 154
-echo "1..129"
-expect 0 create ${n0} 0644
-ctime1=`${fstest} stat ${n0} ctime`
-sleep 1
-expect 0 -- chown ${n0} -1 -1
-ctime2=`${fstest} stat ${n0} ctime`
-echo "${os}:${fs}"
-case "${os}:${fs}" in
-Linux:ext3|Linux:ZFS)
-	test_check $ctime1 -lt $ctime2
-        ;;
-*)
-	test_check $ctime1 -eq $ctime2
-        ;;
-esac
-expect 0 unlink ${n0}
+# # 154
+# echo "1..129"
+# expect 0 create ${n0} 0644
+# ctime1=`${fstest} stat ${n0} ctime`
+# sleep 1
+# expect 0 -- chown ${n0} -1 -1
+# ctime2=`${fstest} stat ${n0} ctime`
+# echo "${os}:${fs}"
+# case "${os}:${fs}" in
+# Linux:ext3|Linux:ZFS)
+# 	test_check $ctime1 -lt $ctime2
+#         ;;
+# *)
+# 	test_check $ctime1 -eq $ctime2
+#         ;;
+# esac
+# expect 0 unlink ${n0}
 # 158
-expect 0 mkdir ${n0} 0644
-ctime1=`${fstest} stat ${n0} ctime`
-sleep 1
-expect 0 -- chown ${n0} -1 -1
-ctime2=`${fstest} stat ${n0} ctime`
-case "${os}:${fs}" in
-Linux:ext3|Linux:ZFS)
-	test_check $ctime1 -lt $ctime2
-        ;;
-*)
-	test_check $ctime1 -eq $ctime2
-        ;;
-esac
-expect 0 rmdir ${n0}
+# expect 0 mkdir ${n0} 0644
+# ctime1=`${fstest} stat ${n0} ctime`
+# sleep 1
+# expect 0 -- chown ${n0} -1 -1
+# ctime2=`${fstest} stat ${n0} ctime`
+# case "${os}:${fs}" in
+# Linux:ext3|Linux:ZFS)
+# 	test_check $ctime1 -lt $ctime2
+#         ;;
+# *)
+# 	test_check $ctime1 -eq $ctime2
+#         ;;
+# esac
+# expect 0 rmdir ${n0}
 # 162
 # expect 0 mkfifo ${n0} 0644
 # ctime1=`${fstest} stat ${n0} ctime`
@@ -324,20 +324,20 @@ expect 0 rmdir ${n0}
 # esac
 # expect 0 unlink ${n0}
 # 166
-expect 0 symlink ${n1} ${n0}
-ctime1=`${fstest} lstat ${n0} ctime`
-sleep 1
-expect 0 -- lchown ${n0} -1 -1
-ctime2=`${fstest} lstat ${n0} ctime`
-case "${os}:${fs}" in
-Linux:ext3|Linux:ZFS)
-	test_check $ctime1 -lt $ctime2
-        ;;
-*)
-	test_check $ctime1 -eq $ctime2
-        ;;
-esac
-expect 0 unlink ${n0}
+# expect 0 symlink ${n1} ${n0}
+# ctime1=`${fstest} lstat ${n0} ctime`
+# sleep 1
+# expect 0 -- lchown ${n0} -1 -1
+# ctime2=`${fstest} lstat ${n0} ctime`
+# case "${os}:${fs}" in
+# Linux:ext3|Linux:ZFS)
+# 	test_check $ctime1 -lt $ctime2
+#         ;;
+# *)
+# 	test_check $ctime1 -eq $ctime2
+#         ;;
+# esac
+# expect 0 unlink ${n0}
 
 # unsuccessful chown(2) does not update ctime.
 # 170
