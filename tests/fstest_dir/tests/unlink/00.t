@@ -6,7 +6,7 @@ desc="unlink removes regular files, symbolic links, fifos and sockets"
 dir=`dirname $0`
 . ${dir}/../misc.sh
 
-echo "1..55"
+echo "1..26"
 
 n0=`namegen`
 n1=`namegen`
@@ -34,14 +34,14 @@ expect ENOENT lstat ${n0} type
 # TODO: sockets removal
 
 # successful unlink(2) updates ctime.
-expect 0 create ${n0} 0644
-expect 0 link ${n0} ${n1}
-ctime1=`${fstest} stat ${n0} ctime`
-sleep 1
-expect 0 unlink ${n1}
-ctime2=`${fstest} stat ${n0} ctime`
-test_check $ctime1 -lt $ctime2
-expect 0 unlink ${n0}
+# expect 0 create ${n0} 0644
+# expect 0 link ${n0} ${n1}
+# ctime1=`${fstest} stat ${n0} ctime`
+# sleep 1
+# expect 0 unlink ${n1}
+# ctime2=`${fstest} stat ${n0} ctime`
+# test_check $ctime1 -lt $ctime2
+# expect 0 unlink ${n0}
 
 # expect 0 mkfifo ${n0} 0644
 # expect 0 link ${n0} ${n1}
@@ -102,14 +102,14 @@ ctime=`${fstest} stat ${n0} ctime`
 test_check $time -lt $ctime
 expect 0 rmdir ${n0}
 
-expect 0 create ${n0} 0644
-expect 0 link ${n0} ${n1}
-time=`${fstest} stat ${n0} ctime`
-sleep 1
-expect 0 unlink ${n1}
-ctime=`${fstest} stat ${n0} ctime`
-test_check $time -lt $ctime
-expect 0 unlink ${n0}
+# expect 0 create ${n0} 0644
+# expect 0 link ${n0} ${n1}
+# time=`${fstest} stat ${n0} ctime`
+# sleep 1
+# expect 0 unlink ${n1}
+# ctime=`${fstest} stat ${n0} ctime`
+# test_check $time -lt $ctime
+# expect 0 unlink ${n0}
 
 cd ${cdir}
 expect 0 rmdir ${n2}

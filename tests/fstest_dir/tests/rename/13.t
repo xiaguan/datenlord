@@ -6,7 +6,7 @@ desc="rename returns ENOTDIR when the 'from' argument is a directory, but 'to' i
 dir=`dirname $0`
 . ${dir}/../misc.sh
 
-echo "1..17"
+echo "1..12"
 
 n0=`namegen`
 n1=`namegen`

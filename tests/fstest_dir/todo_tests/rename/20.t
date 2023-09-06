@@ -6,7 +6,7 @@ desc="rename returns EEXIST or ENOTEMPTY if the 'to' argument is a directory and
 dir=`dirname $0`
 . ${dir}/../misc.sh
 
-echo "1..16"
+echo "1..13"
 
 n0=`namegen`
 n1=`namegen`

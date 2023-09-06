@@ -6,7 +6,7 @@ desc="rename returns EISDIR when the 'to' argument is a directory, but 'from' is
 dir=`dirname $0`
 . ${dir}/../misc.sh
 
-echo "1..17"
+echo "1..12"
 
 n0=`namegen`
 n1=`namegen`

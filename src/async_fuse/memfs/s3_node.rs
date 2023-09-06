@@ -129,7 +129,6 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3Node<S> {
         }
     }
 
-    #[allow(dead_code)]
     /// Deserialize `S3Node` from `SerialNode`
     // This function returns a `BoxFuture due` to its potential for recursive calls
     // (`get_node_from_kv_engine()`). Recursive async functions in Rust can lead
