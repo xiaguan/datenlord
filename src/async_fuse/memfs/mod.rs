@@ -337,7 +337,6 @@ impl<M: MetaData + Send + Sync + 'static> FileSystem for MemFs<M> {
     /// inodes will receive a forget message.
     async fn forget(&self, req: &Request<'_>, nlookup: u64) {
         let ino = req.nodeid();
-        debug!("forget(ino={}, nlookup={}, req={:?})", ino, nlookup, req,);
         self.metadata.forget(ino, nlookup).await;
     }
 

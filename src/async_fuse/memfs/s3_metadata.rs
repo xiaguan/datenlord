@@ -16,7 +16,7 @@ use nix::sys::stat::SFlag;
 use parking_lot::RwLock as SyncRwLock;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::cache::{GlobalCache, IoMemBlock};
 use super::dir::DirEntry;
@@ -322,20 +322,17 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
                 );
             });
 
-            let previous_count = inode.dec_lookup_count_by(nlookup);
-            current_count = inode.get_lookup_count();
-            debug_assert!(current_count >= 0);
-            debug_assert_eq!(
-                previous_count.overflow_sub(current_count),
-                nlookup.cast::<i64>()
-            ); // assert no race forget
+            let previous_count = inode.get_lookup_count();
             debug!(
-                "forget() successfully reduced lookup count of ino={} and name={:?} from {} to {}",
-                ino,
-                inode.get_name(),
+                "previous_count = {} nlookup = {} inode_type = {:?}",
                 previous_count,
-                current_count,
+                nlookup,
+                inode.get_type()
             );
+            let _ = inode.dec_lookup_count_by(nlookup);
+            current_count = inode.get_lookup_count();
+            debug!("decremented the lookup count of ino={ino} by {nlookup}");
+            debug_assert!(current_count >= 0);
             self.set_node_to_kv_engine(ino, inode).await;
         };
         self.try_delete_node(ino).await;
@@ -662,11 +659,6 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         node_name: &str,
         node_type: SFlag,
     ) -> DatenLordResult<()> {
-        debug!(
-            "remove_node_helper() about to remove parent ino={:?}, \
-            child_name={:?}, child_type={:?}",
-            parent, node_name, node_type
-        );
         self.remove_node_local(parent, node_name, node_type, false)
             .await?;
         self.load_parent_from_cache_and_mark_dirty(parent).await;
@@ -682,10 +674,6 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
         parent: INum,
         child_name: &str,
     ) -> DatenLordResult<(Duration, FuseAttr, u64)> {
-        debug!(
-            "lookup_helper() about to lookup parent ino={} and name={:?}",
-            parent, child_name
-        );
         let pre_check_res = self
             .lookup_pre_check(parent, child_name, context.uid, context.gid)
             .await;
@@ -703,6 +691,9 @@ impl<S: S3BackEnd + Sync + Send + 'static> MetaData for S3MetaData<S> {
             let child_node = self.get_node_from_kv_engine(child_ino).await;
             if let Some(node) = child_node {
                 let attr = node.lookup_attr();
+                debug!("The node 's lookup_count={:?} ", node.get_lookup_count());
+                // set back to kv engine
+                self.set_node_to_kv_engine(child_ino, node).await;
                 let fuse_attr = fs_util::convert_to_fuse_attr(attr);
                 return Ok((ttl, fuse_attr, MY_GENERATION));
             }
@@ -1130,6 +1121,7 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3MetaData<S> {
                 );
             });
         parent_node.get_attr().check_perm(uid, gid, 1)?;
+        // Increment the parent node 's lookup count
         if let Some(child_entry) = parent_node.get_entry(name) {
             let ino = child_entry.ino();
             let child_type = child_entry.entry_type();
@@ -1501,11 +1493,6 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3MetaData<S> {
         node_type: SFlag,
         from_remote: bool,
     ) -> DatenLordResult<()> {
-        debug!(
-            "remove_node_local() about to remove parent ino={:?}, \
-            child_name={:?}, child_type={:?}",
-            parent, node_name, node_type
-        );
         let node_ino: INum;
         {
             // pre-checks
@@ -1520,7 +1507,7 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3MetaData<S> {
                 });
             match parent_node.get_entry(node_name) {
                 None => {
-                    debug!(
+                    info!(
                         "remove_node_local() failed to find i-node name={:?} \
                             under parent of ino={}",
                         node_name, parent,
@@ -1549,7 +1536,7 @@ impl<S: S3BackEnd + Send + Sync + 'static> S3MetaData<S> {
                                     );
                                 });
                         if !dir_node.is_node_data_empty() {
-                            debug!(
+                            info!(
                                 "remove_node_local() cannot remove \
                                     the non-empty directory name={:?} of ino={} \
                                     under the parent directory of ino={}",
