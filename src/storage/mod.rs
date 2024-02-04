@@ -6,6 +6,7 @@ mod memory_cache;
 mod storage_manager;
 mod storage_trait;
 
+mod cache;
 pub mod error;
 pub mod policy;
 

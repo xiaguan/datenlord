@@ -65,6 +65,8 @@ tracing-subscriber = "0.3"
 hashlink = "0.8.4"
 clap = { version = "4", features = ["derive"] }
 opendal = "0.43.0"
+bytes = "1.5.0"
+hashbrown = "0.14.3"
 
 [build-dependencies]
 protoc-grpcio = "3.0.0"
